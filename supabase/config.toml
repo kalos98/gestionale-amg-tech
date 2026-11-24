@@ -1,0 +1,3 @@
+# Configurazione locale e deploy Supabase Edge Functions
+[functions.manage-users]
+verify_jwt = false

@@ -1,0 +1,85 @@
+name: Backup Automatico Criptato (DB + Foto)
+
+on:
+  schedule:
+    # Ogni notte alle 02:30 UTC
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  encrypted-backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Installazione PostgreSQL client e GnuPG
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client gnupg
+
+      - name: Installazione dipendenze per script backup Storage
+        run: npm ci --ignore-scripts
+
+      - name: Backup Database PostgreSQL cifrato AES-256
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_ENCRYPTION_PASSPHRASE: ${{ secrets.BACKUP_ENCRYPTION_PASSPHRASE }}
+          BACKUP_DIR: ./backups-out
+          BACKUP_RETENTION_DAYS: '30'
+        run: |
+          if [[ -z "${DATABASE_URL}" || -z "${BACKUP_ENCRYPTION_PASSPHRASE}" ]]; then
+            echo "Secrets DATABASE_URL o BACKUP_ENCRYPTION_PASSPHRASE non configurati: impostali nelle impostazioni GitHub Actions."
+            exit 1
+          fi
+          chmod +x ./scripts/backup-db.sh
+          ./scripts/backup-db.sh
+
+      - name: Backup Storage Foto cifrato AES-256
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          BACKUP_ENCRYPTION_PASSPHRASE: ${{ secrets.BACKUP_ENCRYPTION_PASSPHRASE }}
+        run: |
+          if [[ -z "${SUPABASE_URL}" || -z "${SUPABASE_SERVICE_ROLE_KEY}" ]]; then
+            echo "Secrets SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY non configurati: salto export Storage."
+            exit 0
+          fi
+          TMP_STORAGE="$(mktemp -d)"
+          mkdir -m 700 "$TMP_STORAGE/gnupg"
+          export GNUPGHOME="$TMP_STORAGE/gnupg"
+          mkdir -p "$TMP_STORAGE/files"
+          node ./scripts/backup-storage.mjs "$TMP_STORAGE/files"
+          TS="$(date -u +%Y%m%d-%H%M%S)"
+          tar -C "$TMP_STORAGE/files" -czf "$TMP_STORAGE/amgtech-photos-${TS}.tar.gz" .
+          gpg --batch --yes --pinentry-mode loopback --symmetric --cipher-algo AES256 \
+            --passphrase-fd 3 \
+            --output "./backups-out/amgtech-photos-${TS}.tar.gz.gpg" \
+            "$TMP_STORAGE/amgtech-photos-${TS}.tar.gz" \
+            3<<<"$BACKUP_ENCRYPTION_PASSPHRASE"
+          rm -rf "$TMP_STORAGE"
+
+      - name: Verifica integrità archivi cifrati
+        run: |
+          ls -lh ./backups-out/
+          for f in ./backups-out/*.gpg; do
+            test -s "$f"
+          done
+
+      - name: Salvataggio Artifact Cifrati (90 giorni)
+        uses: actions/upload-artifact@v4
+        with:
+          name: amgtech-encrypted-backup-${{ github.run_number }}
+          path: ./backups-out/*.gpg
+          retention-days: 90
